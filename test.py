@@ -1,27 +1,66 @@
 import ctypes
 import sys
+import os
+from pathlib import Path
 
+# Проверка аргументов
 if len(sys.argv) != 5:
-    print("Usage: test.py <lib> <key> <input> <output>")
+    print("Использование: test.py <lib> <key> <input> <output>")
+    print("Пример: test.py ./libcaesar.so 42 input.txt output.txt")
     sys.exit(1)
 
-lib = ctypes.CDLL(sys.argv[1])
-key = int(sys.argv[2])
+lib_path, key_str, input_file, output_file = sys.argv[1:5]
 
-lib.cezare_key.argtypes = [ctypes.c_char]
-lib.cezare_key(chr(key).encode('latin1')[0])
+# Проверка ключа
+try:
+    key = int(key_str)
+    if key < 0 or key > 255:
+        print(f"Ошибка: ключ должен быть от 0 до 255, получено {key}")
+        sys.exit(1)
+except ValueError:
+    print(f"Ошибка: ключ должен быть числом, получено '{key_str}'")
+    sys.exit(1)
 
-lib.cezare_enc.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+# Проверка входного файла
+if not os.path.exists(input_file):
+    print(f"Ошибка: входной файл '{input_file}' не найден")
+    sys.exit(1)
 
-with open(sys.argv[3], 'rb') as f:
-    data = f.read()
-
-in_buf = ctypes.create_string_buffer(data, len(data))
-out_buf = ctypes.create_string_buffer(len(data))
-
-lib.cezare_enc(in_buf, out_buf, len(data))
-
-with open(sys.argv[4], 'wb') as f:
-    f.write(out_buf.raw[:len(data)])
-
-print(f"Done: {sys.argv[3]} -> {sys.argv[4]}")
+try:
+    # Загрузка библиотеки
+    lib = ctypes.CDLL(lib_path)
+    
+    # Настройка типов аргументов
+    lib.cezare_key.argtypes = [ctypes.c_char]
+    lib.cezare_key.restype = None
+    
+    lib.cezare_enc.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    lib.cezare_enc.restype = None
+    
+    # Установка ключа
+    lib.cezare_key(chr(key).encode('latin1')[0])
+    
+    # Чтение входного файла
+    with open(input_file, 'rb') as f:
+        data = f.read()
+    
+    # Шифрование
+    in_buf = ctypes.create_string_buffer(data, len(data))
+    out_buf = ctypes.create_string_buffer(len(data))
+    lib.cezare_enc(in_buf, out_buf, len(data))
+    
+    # Создание выходной директории
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+    
+    # Запись результата
+    with open(output_file, 'wb') as f:
+        f.write(out_buf.raw[:len(data)])
+    
+    print(f"Готово: {input_file} -> {output_file}")
+    
+except ctypes.CDLLError as e:
+    print(f"Ошибка загрузки библиотеки '{lib_path}': {e}")
+    sys.exit(1)
+except Exception as e:
+    print(f"Ошибка: {e}")
+    sys.exit(1)
