@@ -9,7 +9,7 @@
 #include <errno.h>
 #include "caesar.h"
 
-#define BUFFER_SIZE 4096ы
+#define BUFFER_SIZE 4096
 #define MAX_FILES 100
 #define NUM_THREADS 3
 #define DEADLOCK_TIMEOUT_SEC 5
