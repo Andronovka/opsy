@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -11,12 +12,9 @@
 
 #define BUFFER_SIZE 4096
 #define MAX_FILES 100
-#define NUM_THREADS 3
 #define DEADLOCK_TIMEOUT_SEC 5
-#define BUFFER_SIZE 4096
 #define WORKERS_COUNT 4
 
-// Структура состояния — создаётся в main и передается по указателю
 typedef struct {
     char **files;
     int total_files;
@@ -28,12 +26,31 @@ typedef struct {
     pthread_cond_t cond;
 } AppState;
 
-// Единственная разрешённая глобальная переменная для сигналов
 volatile sig_atomic_t stop = 0;
 
 void handle_sigint(int sig) {
     (void)sig;
     stop = 1;
+}
+
+// Обработчик Segmentation Fault
+void handle_sigsegv(int sig, siginfo_t *info, void *context) {
+    (void)sig;
+    (void)context;
+    
+    void *fault_addr = info->si_addr;
+    void *protected_ptr = get_protected_key_ptr();
+
+    // Различаем несанкционированный доступ и обычную ошибку памяти
+    if (protected_ptr && fault_addr >= protected_ptr && fault_addr < (void*)((char*)protected_ptr + 16)) {
+        fprintf(stderr, "\n[SECURITY ALERT] Перехват SIGSEGV: Попытка несанкционированной записи в защищенную область ключа (адрес %p)!\n", fault_addr);
+        cezare_cleanup();
+        exit(139); // Завершаем с ненулевым кодом
+    } else {
+        fprintf(stderr, "\n[ERROR] Критическая ошибка: Segmentation fault по неизвестному адресу %p\n", fault_addr);
+        cezare_cleanup();
+        exit(139);
+    }
 }
 
 void get_timestamp(char *buffer, size_t size) {
@@ -42,7 +59,6 @@ void get_timestamp(char *buffer, size_t size) {
     strftime(buffer, size, "%Y-%m-%d %H:%M:%S", tm_info);
 }
 
-// Передаем state как аргумент, а не берём из глобальной области
 void log_operation(AppState *state, const char *filename, const char *result, long exec_time_ms) {
     char timestamp[64];
     get_timestamp(timestamp, sizeof(timestamp));
@@ -56,7 +72,6 @@ void log_operation(AppState *state, const char *filename, const char *result, lo
     pthread_mutex_unlock(&state->mutex);
 }
 
-// Логика обработки файла (передаём output_dir параметром)
 long process_file_logic(const char *filename, const char *out_dir) {
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -92,31 +107,6 @@ long process_file_logic(const char *filename, const char *out_dir) {
     return (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
 }
 
-// Создание выходной директории с проверкой существования
-int create_output_dir(const char *dir) {
-    struct stat st = {0};
-    if (stat(dir, &st) == -1) {
-        return mkdir(dir, 0700);
-    }
-    return 0;  // директория уже существует
-}
-
-// Безопасный захват мьютекса с таймаутом (защита от взаимоблокировок)
-int safe_mutex_lock(pthread_mutex_t *mutex) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += DEADLOCK_TIMEOUT_SEC;
-    
-    int ret = pthread_mutex_timedlock(mutex, &ts);
-    if (ret == ETIMEDOUT) {
-        fprintf(stderr, "Возможная взаимоблокировка: поток %lu ожидает мьютекс более %d секунд\n",
-                (unsigned long)pthread_self(), DEADLOCK_TIMEOUT_SEC);
-        pthread_mutex_lock(mutex);  // принудительный захват
-    }
-    return ret;
-}
-
-// Рабочий поток
 void *worker_thread(void *arg) {
     AppState *state = (AppState *)arg;
     while (!stop) {
@@ -172,12 +162,30 @@ void run_processing(AppState *state, int is_parallel, long *total_time) {
 }
 
 int main(int argc, char *argv[]) {
+    // Регистрация умного обработчика SIGSEGV
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = handle_sigsegv;
+    sa.sa_flags = SA_SIGINFO; // Важно: позволяет получить адрес сбойной памяти
+    sigaction(SIGSEGV, &sa, NULL);
+
+    if (argc == 2 && strcmp(argv[1], "--test-segv") == 0) {
+        printf("=== Тестирование защиты памяти ===\n");
+        printf("1. Инициализируем ключ (mmap + mprotect)\n");
+        cezare_key(42);
+        printf("2. Попытка прямой записи в память ключа без прав\n");
+        test_memory_violation();
+        printf("Этот текст не должен появиться!\n");
+        return 0;
+    }
+
     if (argc < 4) {
-        printf("Использование: %s [--mode=sequential|parallel] file1 file2 ... output_dir/ key\n", argv[0]);
+        printf("Использование: %s [--mode=sequential|parallel] file1 ... output_dir/ key\n", argv[0]);
+        printf("Для тестирования защиты: %s --test-segv\n", argv[0]);
         return 1;
     }
 
-    int mode_flag = 0; // 0 - auto
+    int mode_flag = 0;
     int file_start_idx = 1;
 
     if (strncmp(argv[1], "--mode=", 7) == 0) {
@@ -190,7 +198,6 @@ int main(int argc, char *argv[]) {
         file_start_idx = 2;
     }
 
-    // Инициализация локального состояния внутри main
     AppState state = {0};
     state.total_files = argc - file_start_idx - 2;
     state.files = &argv[file_start_idx];
@@ -229,6 +236,9 @@ int main(int argc, char *argv[]) {
     if (state.log_file) fclose(state.log_file);
     pthread_mutex_destroy(&state.mutex);
     pthread_cond_destroy(&state.cond);
+
+    // Освобождение и затирание памяти перед выходом из программы
+    cezare_cleanup();
 
     return 0;
 }
